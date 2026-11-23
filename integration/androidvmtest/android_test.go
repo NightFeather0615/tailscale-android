@@ -4,9 +4,12 @@
 package androidvmtest
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	_ "embed"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"io"
@@ -19,11 +22,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"tailscale.com/client/local"
+	"tailscale.com/client/tailscale/apitype"
 	"tailscale.com/derp/derpserver"
+	_ "tailscale.com/feature/taildrop"
 	"tailscale.com/ipn/store/mem"
 	"tailscale.com/net/stun/stuntest"
 	"tailscale.com/tailcfg"
@@ -36,6 +43,12 @@ import (
 
 //go:embed testdata/NetprobeReceiver.kt
 var netprobeReceiverKotlin []byte
+
+//go:embed testdata/ShareFileActivity.kt
+var shareFileActivityKotlin []byte
+
+//go:embed testdata/FilesProvider.kt
+var filesProviderKotlin []byte
 
 var (
 	adbPath       = flag.String("android.adb", "adb", "path to adb")
@@ -55,6 +68,7 @@ const (
 	authKey           = "tskey-integration-android"
 	debugKeystorePass = "android"
 	wantBody          = "hello-from-tsnet-android-integration"
+	peerHostname      = "tsnetpeer"
 )
 
 func TestAndroidAuthKeyLogin(t *testing.T) {
@@ -67,6 +81,7 @@ type androidEnv struct {
 	adb        adbRunner
 	control    *testcontrol.Server
 	controlURL string
+	peer       *tsnet.Server
 	peerIP     netip.Addr
 }
 
@@ -93,6 +108,8 @@ func newAndroidEnv(t *testing.T) *androidEnv {
 		DERPMap:        derpMap,
 		RequireAuthKey: authKey,
 		AllOnline:      true,
+		// Taildrop only sends between a user's own devices, so every node gets the same user.
+		AllNodesSameUser: true,
 	}
 	controlServer := httptest.NewServer(control)
 	t.Cleanup(controlServer.Close)
@@ -105,7 +122,7 @@ func newAndroidEnv(t *testing.T) *androidEnv {
 		Dir:        t.TempDir(),
 		ControlURL: controlServer.URL,
 		AuthKey:    authKey,
-		Hostname:   "tsnetpeer",
+		Hostname:   peerHostname,
 		Ephemeral:  true,
 		Logf:       logger.WithPrefix(t.Logf, "tsnet: "),
 		Store:      new(mem.Store),
@@ -141,7 +158,7 @@ func newAndroidEnv(t *testing.T) *androidEnv {
 	adb.run(t, "install", "-r", "-t", probeAPKPath)
 	t.Cleanup(func() { adb.runAllowError(t, "uninstall", probePackage) })
 	t.Cleanup(func() { adb.runAllowError(t, "shell", "am", "force-stop", androidPackage) })
-	return &androidEnv{adb: adb, control: control, controlURL: controlURL, peerIP: peerIP}
+	return &androidEnv{adb: adb, control: control, controlURL: controlURL, peer: peer, peerIP: peerIP}
 }
 
 func (e *androidEnv) loginWithDebugBroadcast(t *testing.T) {
@@ -200,6 +217,101 @@ func (e *androidEnv) checkPeerTraffic(t *testing.T) {
 	}
 }
 
+func (e *androidEnv) peerClient(t *testing.T) *local.Client {
+	t.Helper()
+	lc, err := e.peer.LocalClient()
+	if err != nil {
+		t.Fatalf("tsnet peer LocalClient: %v", err)
+	}
+	return lc
+}
+
+func (e *androidEnv) peerHasFile(t *testing.T, name string) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	files, err := e.peerClient(t).WaitingFiles(ctx)
+	if err != nil {
+		t.Fatalf("tsnet peer WaitingFiles: %v", err)
+	}
+	return slices.ContainsFunc(files, func(f apitype.WaitingFile) bool { return f.Name == name })
+}
+
+func (e *androidEnv) checkPeerFile(t *testing.T, name string, want []byte) {
+	t.Helper()
+	lc := e.peerClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	rc, size, err := lc.GetWaitingFile(ctx, name)
+	if err != nil {
+		t.Fatalf("tsnet peer GetWaitingFile(%q): %v", name, err)
+	}
+	got, err := io.ReadAll(rc)
+	rc.Close()
+	if err != nil {
+		t.Fatalf("reading %q on the tsnet peer: %v", name, err)
+	}
+	if size != int64(len(want)) || !bytes.Equal(got, want) {
+		t.Fatalf("tsnet peer got %d bytes (size %d) for %q; want the %d bytes the device sent", len(got), size, name, len(want))
+	}
+	if err := lc.DeleteWaitingFile(ctx, name); err != nil {
+		t.Logf("tsnet peer DeleteWaitingFile(%q): %v", name, err)
+	}
+}
+
+func (e *androidEnv) peerSendsFile(t *testing.T, name string, data []byte) <-chan error {
+	t.Helper()
+	lc := e.peerClient(t)
+	var target tailcfg.StableNodeID
+	var lastErr error
+	for deadline := time.Now().Add(*waitTimeout); target == "" && time.Now().Before(deadline); {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		targets, err := lc.FileTargets(ctx)
+		cancel()
+		lastErr = err
+		for _, ft := range targets {
+			if ft.Node.Hostinfo.OS() == "android" {
+				target = ft.Node.StableID
+			}
+		}
+		if target == "" {
+			time.Sleep(time.Second)
+		}
+	}
+	if target == "" {
+		t.Fatalf("the device never became a Taildrop target for the tsnet peer (last FileTargets error: %v)", lastErr)
+	}
+	// The device holds the transfer until a folder is picked, so PushFile runs in the background.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() {
+		done <- lc.PushFile(ctx, target, int64(len(data)), name, bytes.NewReader(data))
+	}()
+	return done
+}
+
+func taildropFile(t *testing.T, kind string, n int) (name, content string) {
+	t.Helper()
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	return fmt.Sprintf("taildrop-%s-%d.bin", kind, time.Now().UnixNano()), hex.EncodeToString(b)
+}
+
+func checkDeviceFile(t *testing.T, e *androidEnv, path, want string) {
+	t.Helper()
+	t.Cleanup(func() { e.adb.runAllowError(t, "shell", "rm", "-f", path) })
+	for deadline := time.Now().Add(*waitTimeout); time.Now().Before(deadline); time.Sleep(time.Second) {
+		if got, err := e.adb.runOutputAllowError("exec-out", "cat", path); err == nil && got == want {
+			return
+		}
+	}
+	found, _ := e.adb.runOutputAllowError("shell", "find", "/sdcard", "-name", filepath.Base(path))
+	t.Fatalf("%s never had the %d bytes the tsnet peer sent; find /sdcard shows:\n%s", path, len(want), found)
+}
+
 func buildAndroidProbe(t *testing.T) string {
 	t.Helper()
 	out := t.TempDir() + "/tailscale-android-netprobe"
@@ -230,6 +342,8 @@ func buildProbeAPK(t *testing.T, probePath string) string {
     <uses-permission android:name="android.permission.INTERNET"/>
     <application android:debuggable="true" android:extractNativeLibs="true" android:label="Tailscale Integration Probe">
         <receiver android:name=".NetprobeReceiver" android:exported="true"/>
+        <activity android:name=".ShareFileActivity" android:exported="true"/>
+        <provider android:name=".FilesProvider" android:authorities="com.tailscale.ipn.integrationprobe.files" android:exported="false" android:grantUriPermissions="true"/>
     </application>
 </manifest>
 `), 0644); err != nil {
@@ -258,9 +372,20 @@ func buildProbeAPK(t *testing.T, probePath string) string {
 	if err := copyFile(filepath.Join(libDir, "libnetprobe.so"), probePath, 0755); err != nil {
 		t.Fatal(err)
 	}
-	kotlinSrc := filepath.Join(kotlinSrcDir, "NetprobeReceiver.kt")
-	if err := os.WriteFile(kotlinSrc, netprobeReceiverKotlin, 0644); err != nil {
-		t.Fatal(err)
+	var kotlinSrcs []string
+	for _, src := range []struct {
+		name string
+		data []byte
+	}{
+		{"NetprobeReceiver.kt", netprobeReceiverKotlin},
+		{"ShareFileActivity.kt", shareFileActivityKotlin},
+		{"FilesProvider.kt", filesProviderKotlin},
+	} {
+		path := filepath.Join(kotlinSrcDir, src.name)
+		if err := os.WriteFile(path, src.data, 0644); err != nil {
+			t.Fatal(err)
+		}
+		kotlinSrcs = append(kotlinSrcs, path)
 	}
 
 	runCmd(t, root, "keytool",
@@ -284,13 +409,13 @@ func buildProbeAPK(t *testing.T, probePath string) string {
 		"--target-sdk-version", "34",
 		"-o", unsignedAPK,
 	)
-	runCmd(t, root, kotlinCompiler(t),
+	kotlincArgs := append([]string{
 		"-jvm-target", "1.8",
 		"-no-reflect",
 		"-classpath", androidJar(t),
 		"-d", classesDir,
-		kotlinSrc,
-	)
+	}, kotlinSrcs...)
+	runCmd(t, root, kotlinCompiler(t), kotlincArgs...)
 	d8Inputs := append(classFiles(t, classesDir), kotlinStdlibJar(t))
 	d8Args := append([]string{"--min-api", "24", "--lib", androidJar(t), "--output", dexDir}, d8Inputs...)
 	runCmd(t, root, androidBuildTool(t, "d8"), d8Args...)

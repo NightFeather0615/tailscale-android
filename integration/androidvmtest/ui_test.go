@@ -31,6 +31,7 @@ type uiNode struct {
 	Desc       string   `xml:"content-desc,attr"`
 	Checkable  bool     `xml:"checkable,attr"`
 	Checked    bool     `xml:"checked,attr"`
+	Enabled    bool     `xml:"enabled,attr"`
 	Focused    bool     `xml:"focused,attr"`
 	Bounds     string   `xml:"bounds,attr"`
 	Children   []uiNode `xml:"node"`
@@ -105,6 +106,16 @@ func withResourceIDSuffix(suffix string) func(uiNode) bool {
 	return func(n uiNode) bool { return strings.HasSuffix(n.ResourceID, suffix) }
 }
 
+func withTextFold(text string) func(uiNode) bool {
+	return func(n uiNode) bool { return strings.EqualFold(n.Text, text) }
+}
+
+func withTextPrefixFold(prefix string) func(uiNode) bool {
+	return func(n uiNode) bool {
+		return len(n.Text) >= len(prefix) && strings.EqualFold(n.Text[:len(prefix)], prefix)
+	}
+}
+
 var boundsRE = regexp.MustCompile(`^\[(\d+),(\d+)\]\[(\d+),(\d+)\]$`)
 
 func (n uiNode) center() (x, y int, err error) {
@@ -137,7 +148,12 @@ func dumpUI(adb adbRunner) (uiScreen, error) {
 
 func pollUI(t *testing.T, adb adbRunner, what string, step func(uiScreen) bool) uiScreen {
 	t.Helper()
-	deadline := time.Now().Add(*waitTimeout)
+	return pollUIFor(t, adb, what, *waitTimeout, step)
+}
+
+func pollUIFor(t *testing.T, adb adbRunner, what string, timeout time.Duration, step func(uiScreen) bool) uiScreen {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
 	var last uiScreen
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -153,7 +169,7 @@ func pollUI(t *testing.T, adb adbRunner, what string, step func(uiScreen) bool) 
 		time.Sleep(500 * time.Millisecond)
 	}
 	logUIDiagnostics(t, adb, last, lastErr)
-	t.Fatalf("timed out after %v waiting for %s", *waitTimeout, what)
+	t.Fatalf("timed out after %v waiting for %s", timeout, what)
 	return uiScreen{}
 }
 
@@ -175,6 +191,16 @@ func tap(t *testing.T, adb adbRunner, n uiNode) {
 		t.Fatal(err)
 	}
 	adb.run(t, "shell", "input", "tap", strconv.Itoa(x), strconv.Itoa(y))
+}
+
+func swipeUp(t *testing.T, adb adbRunner) {
+	t.Helper()
+	out := adb.runOutput(t, "shell", "wm", "size")
+	var w, h int
+	if _, err := fmt.Sscanf(strings.TrimSpace(out[strings.LastIndex(out, ":")+1:]), "%dx%d", &w, &h); err != nil {
+		t.Fatalf("parsing wm size %q: %v", out, err)
+	}
+	adb.run(t, "shell", "input", "swipe", strconv.Itoa(w/2), strconv.Itoa(h*3/4), strconv.Itoa(w/2), strconv.Itoa(h/4))
 }
 
 func typeInto(t *testing.T, adb adbRunner, field uiNode, text string) {
