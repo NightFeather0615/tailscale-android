@@ -92,3 +92,5 @@ require (
 	golang.zx2c4.com/wireguard/windows v1.0.1 // indirect
 	gvisor.dev/gvisor v0.0.0-20261117040555-0303b2605d5e // indirect
 )
+
+replace tailscale.com => github.com/NightFeather0615/tailscale v1.107.0-pre.0.20261124231410-2a2e36b1b677
