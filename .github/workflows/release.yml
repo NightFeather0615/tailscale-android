@@ -291,8 +291,14 @@ jobs:
             --ks-pass env:KEYSTORE_PASSWORD --out "${apk}" "${unsigned[0]}"
           rm -f "${apk}.idsig"
 
+          # The line starts with "Signer #1" or "V3.0 Signer:", depending on
+          # the version of the build tools.
           fingerprint=$("${build_tools}/apksigner" verify --print-certs "${apk}" \
-            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+            | sed -n 's/^.*Signer.*certificate SHA-256 digest: //p' | head -n 1)
+          if [[ ! "${fingerprint}" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Could not read the signing certificate of ${apk}."
+            exit 1
+          fi
           echo "CERT_SHA256=${fingerprint}" >> "${GITHUB_ENV}"
           (cd out && sha256sum -- *.apk *.patch > SHA256SUMS)
           ls -l out
