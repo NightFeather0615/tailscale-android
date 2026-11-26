@@ -1,0 +1,313 @@
+name: Release
+
+# Builds the latest stable Tailscale for Android with this fork's patches,
+# signs it, and publishes the APK as a GitHub release.
+#
+# Two sets of patches go in, each as the commits of a "stack" branch on top
+# of the upstream release tag it sits on:
+#
+#   - this repository's, on the Android app
+#   - NightFeather0615/tailscale's, on the tailscale.com module the app
+#     is built from
+#
+# A run moves both onto the release it builds. If one no longer applies, the
+# run fails: rebase that "stack" branch onto the new tag by hand, push it,
+# and run this workflow again.
+#
+# Signing needs two repository secrets: ANDROID_KEYSTORE_BASE64, a PKCS #12
+# keystore with one key, and ANDROID_KEYSTORE_PASSWORD.
+
+on:
+  schedule:
+    # Daily, after the tailscale fork's own release run. A run that finds
+    # nothing new ends within seconds.
+    - cron: "53 4 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream version to build, such as 1.106.1. Empty means the latest stable release.
+        type: string
+      rebuild:
+        description: Build even if this version already has a release (it gets the next build number).
+        type: boolean
+        default: false
+      publish:
+        description: Publish a release. Turn off to only attach the files to the workflow run.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/tailscale/tailscale-android.git
+  OSS_UPSTREAM: https://github.com/tailscale/tailscale.git
+  OSS_FORK: ${{ github.repository_owner }}/tailscale
+  STACK_BRANCH: stack
+  # Fixed committer details make the rebased commits the same on every run.
+  GIT_COMMITTER_NAME: github-actions[bot]
+  GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      release: ${{ steps.plan.outputs.release }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      # GitHub turns off the schedule of a repository without activity for
+      # 60 days. Enabling the workflow again resets that clock.
+      - name: Keep the schedule alive
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/enable"
+
+      - name: Decide what to build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REBUILD: ${{ inputs.rebuild }}
+        run: |
+          set -euo pipefail
+
+          version="${INPUT_VERSION#v}"
+          if [[ -z "${version}" ]]; then
+            # Upstream tags look like 1.106.1-t344347192-g0a7686abf. Stable
+            # releases have an even minor version.
+            version=$(git ls-remote --tags --refs "${UPSTREAM}" \
+              | sed 's|.*refs/tags/||' \
+              | grep -E '^[0-9]+\.[0-9]*[02468]\.[0-9]+-t[0-9a-f]+-g[0-9a-f]+$' \
+              | sed 's/-t.*//' \
+              | sort -V | tail -n 1)
+          fi
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'${version}' is not a version such as 1.106.1"
+            exit 1
+          fi
+
+          # Builds of one upstream version are numbered: v1.106.1-nf.1, -nf.2.
+          last=$(gh api "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/v${version}-nf." \
+            --jq '.[].ref' | sed 's|.*-nf\.||' | sort -n | tail -n 1)
+          build=true
+          if [[ -n "${last}" && "${INPUT_REBUILD}" != "true" ]]; then
+            build=false
+            echo "v${version}-nf.${last} exists; nothing to do."
+          fi
+
+          {
+            echo "version=${version}"
+            echo "release=${version}-nf.$(( ${last:-0} + 1 ))"
+            echo "build=${build}"
+          } >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      RELEASE: ${{ needs.plan.outputs.release }}
+    steps:
+      - name: Check for the signing key
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          PUBLISH: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+        run: |
+          if [[ -n "${KEYSTORE_BASE64}" && -n "${KEYSTORE_PASSWORD}" ]]; then
+            echo "SIGN=true" >> "${GITHUB_ENV}"
+          elif [[ "${PUBLISH}" == "true" ]]; then
+            echo "::error::Set the ANDROID_KEYSTORE_BASE64 and ANDROID_KEYSTORE_PASSWORD secrets."
+            exit 1
+          else
+            # A trial run still shows whether the build works.
+            echo "::warning::No signing key: the APK of this run is unsigned and can't be installed."
+            echo "SIGN=false" >> "${GITHUB_ENV}"
+          fi
+
+      - name: Put the Android patches on ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          git remote add upstream "${UPSTREAM}"
+          git fetch -q --no-tags upstream '+refs/tags/*:refs/tags/*'
+          git fetch -q --no-tags origin \
+            "+refs/heads/${STACK_BRANCH}:refs/remotes/origin/${STACK_BRANCH}"
+
+          tag=$(git for-each-ref --sort=-creatordate --format='%(refname:short)' \
+            "refs/tags/${VERSION}-t*-g*" | head -n 1)
+          if [[ -z "${tag}" ]]; then
+            echo "::error::Upstream has no tag for ${VERSION}."
+            exit 1
+          fi
+          base=$(git describe --tags --abbrev=0 --match '[0-9]*-t*-g*' \
+            "origin/${STACK_BRANCH}")
+          echo "Building ${tag}. The patches sit on ${base}:"
+          git log --oneline "${base}..origin/${STACK_BRANCH}"
+
+          git -c advice.detachedHead=false checkout -q "origin/${STACK_BRANCH}"
+          if [[ "$(git rev-parse "${base}^{commit}")" != "$(git rev-parse "${tag}^{commit}")" ]]; then
+            if ! git rebase --committer-date-is-author-date --onto "${tag}" "${base}"; then
+              echo "::error::The patches on '${STACK_BRANCH}' do not apply to ${tag}. Rebase the branch onto ${tag} and run this workflow again."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "UPSTREAM_TAG=${tag}"
+            echo "STACK_COMMIT=$(git rev-parse "origin/${STACK_BRANCH}")"
+          } >> "${GITHUB_ENV}"
+
+      - name: Put the tailscale.com patches on the version the app uses
+        run: |
+          set -euo pipefail
+
+          oss_version=$(awk '$1 == "tailscale.com" { print $2; exit }' src/go.mod)
+          if [[ ! "${oss_version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::go.mod requires tailscale.com ${oss_version}, which is not a release tag."
+            exit 1
+          fi
+
+          git init -q oss
+          cd oss
+          git remote add upstream "${OSS_UPSTREAM}"
+          git remote add fork "https://github.com/${OSS_FORK}.git"
+          git fetch -q --no-tags upstream '+refs/tags/v1.*:refs/tags/v1.*'
+          git fetch -q --no-tags fork \
+            "+refs/heads/${STACK_BRANCH}:refs/remotes/fork/${STACK_BRANCH}"
+
+          base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' \
+            "fork/${STACK_BRANCH}")
+          echo "tailscale.com ${oss_version}. The patches sit on ${base}:"
+          git log --oneline "${base}..fork/${STACK_BRANCH}"
+
+          git -c advice.detachedHead=false checkout -q "fork/${STACK_BRANCH}"
+          if [[ "$(git rev-parse "${base}^{commit}")" != "$(git rev-parse "${oss_version}^{commit}")" ]]; then
+            if ! git rebase --committer-date-is-author-date --onto "${oss_version}" "${base}"; then
+              echo "::error::The patches on ${OSS_FORK}'s '${STACK_BRANCH}' do not apply to ${oss_version}. Rebase that branch and run this workflow again."
+              exit 1
+            fi
+          fi
+
+          {
+            echo "OSS_VERSION=${oss_version}"
+            echo "OSS_STACK_COMMIT=$(git rev-parse "fork/${STACK_BRANCH}")"
+          } >> "${GITHUB_ENV}"
+
+      - uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b # v5.4.0
+        with:
+          go-version-file: src/go.mod
+          cache: false
+
+      - name: Switch to Java 21
+        uses: actions/setup-java@3a4f6e1af504cf6a31855fa899c6aa5355ba6c12 # v4.7.0
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Build against the patched tailscale.com
+        working-directory: src
+        run: |
+          set -euo pipefail
+
+          mkdir -p ../out
+          git format-patch --stdout "${UPSTREAM_TAG}..HEAD" \
+            > "../out/tailscale-android-nf_${RELEASE}.patch"
+          git -C ../oss format-patch --stdout "${OSS_VERSION}..HEAD" \
+            > "../out/tailscale-nf_${RELEASE}.patch"
+
+          ./tool/go mod edit -replace "tailscale.com=${GITHUB_WORKSPACE}/oss"
+          ./tool/go mod tidy -compat=1.24
+          # A clean tree keeps "-dirty" out of the version.
+          git -c user.name="${GIT_COMMITTER_NAME}" -c user.email="${GIT_COMMITTER_EMAIL}" \
+            commit -q -am "go.mod: build against the patched tailscale.com"
+
+          make version gradle-dependencies
+          (cd android && ./gradlew --no-daemon assembleRelease)
+
+      - name: Keep the unsigned APK
+        if: env.SIGN != 'true'
+        run: |
+          set -euo pipefail
+          unsigned=(src/android/build/outputs/apk/release/*.apk)
+          cp "${unsigned[0]}" "out/tailscale-nf_${RELEASE}-unsigned.apk"
+          echo "CERT_SHA256=none, the APK is unsigned" >> "${GITHUB_ENV}"
+          (cd out && sha256sum -- *.apk *.patch > SHA256SUMS)
+          ls -l out
+
+      - name: Sign
+        if: env.SIGN == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          keystore="${RUNNER_TEMP}/keystore.p12"
+          printf '%s' "${KEYSTORE_BASE64}" | base64 -d > "${keystore}"
+          trap 'rm -f "${keystore}"' EXIT
+
+          build_tools=$(printf '%s\n' "${ANDROID_HOME}"/build-tools/* | sort -V | tail -n 1)
+          unsigned=(src/android/build/outputs/apk/release/*.apk)
+          apk="out/tailscale-nf_${RELEASE}.apk"
+          "${build_tools}/apksigner" sign --ks "${keystore}" \
+            --ks-pass env:KEYSTORE_PASSWORD --out "${apk}" "${unsigned[0]}"
+          rm -f "${apk}.idsig"
+
+          fingerprint=$("${build_tools}/apksigner" verify --print-certs "${apk}" \
+            | sed -n 's/^Signer #1 certificate SHA-256 digest: //p')
+          echo "CERT_SHA256=${fingerprint}" >> "${GITHUB_ENV}"
+          (cd out && sha256sum -- *.apk *.patch > SHA256SUMS)
+          ls -l out
+
+      - name: Write the release notes
+        run: |
+          set -euo pipefail
+          {
+            echo "Tailscale for Android [${VERSION}](https://github.com/tailscale/tailscale-android/releases/tag/${UPSTREAM_TAG}) with this fork's changes:"
+            echo
+            git -C oss log --reverse --format='- %s' "${OSS_VERSION}..HEAD" -- control feature
+            git -C src log --reverse --format='- %s' "${UPSTREAM_TAG}..HEAD~1"
+            echo
+            echo "Install the APK below, or add this repository to Obtainium; see the [README](https://github.com/${GITHUB_REPOSITORY}#install)."
+            echo
+            echo "Signing certificate SHA-256: \`${CERT_SHA256}\`"
+            echo
+            echo "Built from upstream \`${UPSTREAM_TAG}\` plus the commits of [\`${STACK_BRANCH}\`](https://github.com/${GITHUB_REPOSITORY}/commits/${STACK_COMMIT}), against tailscale.com \`${OSS_VERSION}\` plus the commits of [${OSS_FORK}'s \`${STACK_BRANCH}\`](https://github.com/${OSS_FORK}/commits/${OSS_STACK_COMMIT}). The \`.patch\` files below hold the same changes."
+            echo
+            echo "This is an unofficial build. It is not made, endorsed, or supported by Tailscale Inc."
+          } > notes.md
+          cat notes.md
+
+      - name: Attach the files to this run
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: tailscale-android-nf_${{ needs.plan.outputs.release }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish
+        if: github.event_name != 'workflow_dispatch' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${RELEASE}" out/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "${RELEASE}" \
+            --notes-file notes.md
