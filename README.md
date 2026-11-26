@@ -41,6 +41,9 @@ fingerprint:
 51:92:05:6A:57:53:A6:DC:14:AF:33:D6:44:64:66:5A:18:58:BB:87:1A:47:50:33:87:DF:19:AC:3E:82:5C:5A
 ```
 
+`apksigner verify --print-certs` and the release notes show it without the
+colons, in lower case.
+
 ### First login
 
 Before signing in, open the account screen, and choose "Use an alternate
